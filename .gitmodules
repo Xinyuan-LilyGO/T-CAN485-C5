@@ -1,0 +1,4 @@
+[submodule "libraries/lilygo_device_driver"]
+	path = libraries/lilygo_device_driver
+	url = https://github.com/Xinyuan-LilyGO/lilygo_device_driver.git
+	branch = debug

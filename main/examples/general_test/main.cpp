@@ -2,7 +2,7 @@
  * @Description: General board test
  * @Author: LILYGO_L
  * @Date: 2026-06-12 17:30:00
- * @LastEditTime: 2026-06-12 17:30:00
+ * @LastEditTime: 2026-06-13 14:25:44
  * @License: GPL 3.0
  */
 
@@ -24,6 +24,7 @@
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_sntp.h"
 #include "esp_timer.h"
@@ -51,9 +52,11 @@ constexpr char kWifiApSsid[] = "T-CAN485-C5";
 constexpr char kWifiApPassword[] = "12345678";
 constexpr int kWifiApChannel = 6;
 constexpr int kWifiApMaxConnection = 4;
+constexpr int kWifiInfoPeriodMs = 1000;
+constexpr int kTimeUpdatePeriodMs = 20000;
 
 constexpr char kMountPoint[] = "/sdcard";
-constexpr int kSdPollPeriodMs = 2000;
+constexpr int kSdPollPeriodMs = 3000;
 constexpr int kSdSpiMaxFreqKhz = 10000;
 
 constexpr adc_atten_t kAdcAtten = ADC_ATTEN_DB_12;
@@ -133,9 +136,19 @@ volatile bool g_wifi_sta_connected = false;
 int g_adc_mv[3] = {};
 bool g_sd_mounted = false;
 uint64_t g_sd_size_mb = 0;
+uint32_t g_sd_sector_size = 0;
+uint64_t g_sd_sector_count = 0;
 char g_sd_type[24] = "Not mounted";
+char g_sd_name[16] = "-";
+char g_sd_error[96] = "No card";
 char g_sta_ip[16] = "0.0.0.0";
+char g_sta_ssid[33] = "-";
+int8_t g_sta_rssi = 0;
 char g_ap_ip[16] = "192.168.4.1";
+char g_ap_ssid[33] = "T-CAN485-C5";
+char g_time_text[32] = "syncing";
+uint32_t g_time_age_seconds = 0;
+char g_status_json[2048] = {};
 
 size_t g_rs485_total_size = 0;
 size_t g_rs485_bytes_this_time = 0;
@@ -154,7 +167,6 @@ uint32_t g_can_bus_error_count = 0;
 char g_can_state_text[24] = "off";
 
 bool g_sd_spi_bus_ready = false;
-sdmmc_card_t* g_sd_card = nullptr;
 twai_node_handle_t g_can_node = nullptr;
 QueueHandle_t g_can_rx_queue = nullptr;
 volatile uint32_t g_can_error_flags = 0;
@@ -376,9 +388,11 @@ const char* CardTypeName(const sdmmc_card_t* card)
   return (card->ocr & SD_OCR_SDHC_CAP) ? "SDHC/SDXC" : "SDSC";
 }
 
-bool MountSdCard()
+bool ProbeSdCard()
 {
   if (!InitSdSpiBus()) {
+    g_sd_mounted = false;
+    std::snprintf(g_sd_error, sizeof(g_sd_error), "%s", "SPI bus init failed");
     return false;
   }
 
@@ -399,45 +413,38 @@ bool MountSdCard()
   esp_err_t err = esp_vfs_fat_sdspi_mount(kMountPoint, &host, &slot_config,
                                           &mount_config, &card);
   if (err != ESP_OK) {
+    g_sd_mounted = false;
+    g_sd_size_mb = 0;
+    g_sd_sector_size = 0;
+    g_sd_sector_count = 0;
+    std::snprintf(g_sd_type, sizeof(g_sd_type), "%s", "Not mounted");
+    std::snprintf(g_sd_name, sizeof(g_sd_name), "%s", "-");
+    std::snprintf(g_sd_error, sizeof(g_sd_error), "%s", esp_err_to_name(err));
     return false;
   }
 
-  g_sd_card = card;
   g_sd_mounted = true;
   g_sd_size_mb = static_cast<uint64_t>(card->csd.capacity) *
                  card->csd.sector_size / (1024ULL * 1024ULL);
+  g_sd_sector_size = card->csd.sector_size;
+  g_sd_sector_count = card->csd.capacity;
   std::snprintf(g_sd_type, sizeof(g_sd_type), "%s", CardTypeName(card));
-  printf("[sd] mounted type=%s size=%llu MB\n", g_sd_type,
-         static_cast<unsigned long long>(g_sd_size_mb));
+  std::snprintf(g_sd_name, sizeof(g_sd_name), "%.5s",
+                reinterpret_cast<const char*>(card->cid.name));
+  std::snprintf(g_sd_error, sizeof(g_sd_error), "%s", "OK");
+  esp_vfs_fat_sdcard_unmount(kMountPoint, card);
   return true;
-}
-
-bool MountedCardStillReadable()
-{
-  return g_sd_mounted && g_sd_card != nullptr &&
-         sdmmc_get_status(g_sd_card) == ESP_OK;
-}
-
-void UnmountSdCard()
-{
-  if (g_sd_mounted && g_sd_card != nullptr) {
-    esp_vfs_fat_sdcard_unmount(kMountPoint, g_sd_card);
-  }
-  g_sd_card = nullptr;
-  g_sd_mounted = false;
-  g_sd_size_mb = 0;
-  std::snprintf(g_sd_type, sizeof(g_sd_type), "%s", "Not mounted");
-  printf("[sd] removed or unavailable\n");
 }
 
 void SdTask(void* param)
 {
   (void)param;
+  bool last_mounted = false;
   while (true) {
-    if (!g_sd_mounted) {
-      MountSdCard();
-    } else if (!MountedCardStillReadable()) {
-      UnmountSdCard();
+    ProbeSdCard();
+    if (g_sd_mounted != last_mounted) {
+      printf("[sd] %s\n", g_sd_mounted ? "inserted" : "removed");
+      last_mounted = g_sd_mounted;
     }
     vTaskDelay(pdMS_TO_TICKS(kSdPollPeriodMs));
   }
@@ -916,9 +923,61 @@ void StartSntp()
   setenv("TZ", "HKT-8", 1);
   tzset();
   esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+  esp_sntp_set_sync_interval(kTimeUpdatePeriodMs);
   esp_sntp_setservername(0, "pool.ntp.org");
   esp_sntp_setservername(1, "time.google.com");
   esp_sntp_init();
+}
+
+void UpdateTimeText()
+{
+  std::time_t now = 0;
+  std::time(&now);
+  struct tm time_info = {};
+  localtime_r(&now, &time_info);
+  if (time_info.tm_year < (2024 - 1900)) {
+    std::snprintf(g_time_text, sizeof(g_time_text), "%s", "syncing");
+    return;
+  }
+
+  std::strftime(g_time_text, sizeof(g_time_text), "%Y-%m-%d %H:%M:%S",
+                &time_info);
+  g_time_age_seconds = 0;
+}
+
+void TimeTask(void* param)
+{
+  (void)param;
+  uint32_t elapsed_ms = 0;
+  while (true) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    elapsed_ms += 1000;
+    if (elapsed_ms >= kTimeUpdatePeriodMs) {
+      UpdateTimeText();
+      elapsed_ms = 0;
+    } else if (std::strcmp(g_time_text, "syncing") != 0) {
+      ++g_time_age_seconds;
+    }
+  }
+}
+
+void WifiInfoTask(void* param)
+{
+  (void)param;
+  while (true) {
+    wifi_ap_record_t ap_info = {};
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+      g_wifi_sta_connected = true;
+      std::snprintf(g_sta_ssid, sizeof(g_sta_ssid), "%.32s",
+                    reinterpret_cast<const char*>(ap_info.ssid));
+      g_sta_rssi = ap_info.rssi;
+    } else {
+      g_wifi_sta_connected = false;
+      std::snprintf(g_sta_ssid, sizeof(g_sta_ssid), "%s", "-");
+      g_sta_rssi = 0;
+    }
+    vTaskDelay(pdMS_TO_TICKS(kWifiInfoPeriodMs));
+  }
 }
 
 void WifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id,
@@ -931,11 +990,14 @@ void WifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id,
              event_id == WIFI_EVENT_STA_DISCONNECTED) {
     g_wifi_sta_connected = false;
     std::snprintf(g_sta_ip, sizeof(g_sta_ip), "%s", "0.0.0.0");
+    std::snprintf(g_sta_ssid, sizeof(g_sta_ssid), "%s", "-");
+    g_sta_rssi = 0;
     esp_wifi_connect();
   } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
     const ip_event_got_ip_t* event =
         static_cast<const ip_event_got_ip_t*>(event_data);
     g_wifi_sta_connected = true;
+    std::snprintf(g_sta_ssid, sizeof(g_sta_ssid), "%s", kWifiStaSsid);
     std::snprintf(g_sta_ip, sizeof(g_sta_ip), IPSTR,
                   IP2STR(&event->ip_info.ip));
   }
@@ -961,6 +1023,11 @@ void InitWifi()
 
   wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&init_config));
+  uint8_t ap_mac[6] = {};
+  ESP_ERROR_CHECK(esp_read_mac(ap_mac, ESP_MAC_WIFI_SOFTAP));
+  std::snprintf(g_ap_ssid, sizeof(g_ap_ssid),
+                "%s_%02X%02X%02X%02X%02X%02X", kWifiApSsid, ap_mac[0],
+                ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
   ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                              &WifiEventHandler, nullptr));
   ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
@@ -974,9 +1041,12 @@ void InitWifi()
   sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
   wifi_config_t ap_config = {};
-  std::snprintf(reinterpret_cast<char*>(ap_config.ap.ssid),
-                sizeof(ap_config.ap.ssid), "%s", kWifiApSsid);
-  ap_config.ap.ssid_len = std::strlen(kWifiApSsid);
+  size_t ap_ssid_len = std::strlen(g_ap_ssid);
+  if (ap_ssid_len > sizeof(ap_config.ap.ssid)) {
+    ap_ssid_len = sizeof(ap_config.ap.ssid);
+  }
+  std::memcpy(ap_config.ap.ssid, g_ap_ssid, ap_ssid_len);
+  ap_config.ap.ssid_len = ap_ssid_len;
   std::snprintf(reinterpret_cast<char*>(ap_config.ap.password),
                 sizeof(ap_config.ap.password), "%s", kWifiApPassword);
   ap_config.ap.channel = kWifiApChannel;
@@ -990,45 +1060,34 @@ void InitWifi()
   StartSntp();
 }
 
-std::string CurrentTimeString()
+const char* StatusJson()
 {
-  std::time_t now = 0;
-  std::time(&now);
-  struct tm time_info = {};
-  localtime_r(&now, &time_info);
-  if (time_info.tm_year < (2024 - 1900)) {
-    return "syncing";
-  }
-
-  char buffer[32] = {};
-  std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &time_info);
-  return buffer;
-}
-
-std::string StatusJson()
-{
-  char buffer[1536] = {};
   const TestMode rs485_mode = g_rs485_mode;
   const TestMode can_mode = g_can_mode;
-  const std::string time_text = CurrentTimeString();
 
   std::snprintf(
-      buffer, sizeof(buffer),
+      g_status_json, sizeof(g_status_json),
       "{"
-      "\"time\":\"%s\","
-      "\"wifi\":{\"sta\":%s,\"sta_ip\":\"%s\",\"ap_ssid\":\"%s\","
-      "\"ap_ip\":\"%s\"},"
-      "\"sd\":{\"mounted\":%s,\"type\":\"%s\",\"size_mb\":%llu},"
+      "\"time\":\"%s\",\"time_age_seconds\":%lu,"
+      "\"wifi\":{\"sta\":%s,\"sta_ssid\":\"%s\",\"sta_ip\":\"%s\","
+      "\"sta_rssi\":%d,\"ap_ssid\":\"%s\",\"ap_ip\":\"%s\"},"
+      "\"sd\":{\"mounted\":%s,\"name\":\"%s\",\"type\":\"%s\","
+      "\"size_mb\":%llu,\"sector_size\":%lu,\"sector_count\":%llu,"
+      "\"error\":\"%s\"},"
       "\"adc\":[%d,%d,%d],"
       "\"rs485\":{\"mode\":\"%s\",\"total\":%u,\"ok\":%s,"
       "\"crc_errors\":%lu,\"sequence_errors\":%lu},"
       "\"can\":{\"mode\":\"%s\",\"total\":%u,\"ok\":%s,\"state\":\"%s\","
       "\"bus_errors\":%lu}"
       "}",
-      time_text.c_str(), g_wifi_sta_connected ? "true" : "false", g_sta_ip,
-      kWifiApSsid, g_ap_ip, g_sd_mounted ? "true" : "false", g_sd_type,
-      static_cast<unsigned long long>(g_sd_size_mb), g_adc_mv[0],
-      g_adc_mv[1], g_adc_mv[2], ModeName(rs485_mode),
+      g_time_text, static_cast<unsigned long>(g_time_age_seconds),
+      g_wifi_sta_connected ? "true" : "false", g_sta_ssid,
+      g_sta_ip, static_cast<int>(g_sta_rssi), g_ap_ssid, g_ap_ip,
+      g_sd_mounted ? "true" : "false", g_sd_name, g_sd_type,
+      static_cast<unsigned long long>(g_sd_size_mb),
+      static_cast<unsigned long>(g_sd_sector_size),
+      static_cast<unsigned long long>(g_sd_sector_count), g_sd_error,
+      g_adc_mv[0], g_adc_mv[1], g_adc_mv[2], ModeName(rs485_mode),
       static_cast<unsigned>(g_rs485_total_size),
       g_rs485_data_ok ? "true" : "false",
       static_cast<unsigned long>(g_rs485_crc_error_count),
@@ -1036,7 +1095,7 @@ std::string StatusJson()
       ModeName(can_mode),
       static_cast<unsigned>(g_can_total_size), g_can_data_ok ? "true" : "false",
       g_can_state_text, static_cast<unsigned long>(g_can_bus_error_count));
-  return buffer;
+  return g_status_json;
 }
 
 constexpr char kIndexHtml[] = R"HTML(
@@ -1062,15 +1121,13 @@ button.active{background:#1f8f5f;border-color:#32b878}
 <header><h1>T-CAN485-C5 Control Center</h1><div class="small">AP and STA are enabled</div></header>
 <main>
 <section class="grid">
-<div class="card"><div class="label">Time</div><div class="value" id="time">-</div></div>
-<div class="card"><div class="label">STA</div><div class="value" id="sta">-</div><div class="small" id="staip"></div></div>
 <div class="card"><div class="label">AP</div><div class="value" id="ap">-</div><div class="small" id="apip"></div></div>
+<div class="card"><div class="label">Time</div><div class="value" id="time">-</div><div class="small" id="timeage"></div></div>
+<div class="card"><div class="label">STA</div><div class="value" id="sta">-</div><div class="small" id="staip"></div></div>
 </section>
 <section class="grid">
 <div class="card"><div class="label">SD Card</div><div class="value" id="sd">-</div><div class="small" id="sdinfo"></div></div>
-<div class="card"><div class="label">ADC 1</div><div class="value" id="adc0">-</div></div>
-<div class="card"><div class="label">ADC 2</div><div class="value" id="adc1">-</div></div>
-<div class="card"><div class="label">ADC 3</div><div class="value" id="adc2">-</div></div>
+<div class="card"><div class="label">ADC</div><div class="value" id="adc">-</div></div>
 </section>
 <section class="grid">
 <div class="card"><div class="label">RS485</div><div class="value" id="rs485">-</div><div class="small" id="rs485t"></div><div class="row"><button onclick="setMode('rs485','send')">Send</button><button onclick="setMode('rs485','receive')">Receive</button><button onclick="setMode('rs485','stop')">Stop</button></div></div>
@@ -1081,12 +1138,14 @@ button.active{background:#1f8f5f;border-color:#32b878}
 async function setMode(target,mode){await fetch(`/api/set?target=${target}&mode=${mode}`);refresh();}
 async function refresh(){
  const s=await (await fetch('/api/status')).json();
- time.textContent=s.time; sta.textContent=s.wifi.sta?'Connected':'Connecting'; sta.className='value '+(s.wifi.sta?'ok':'bad');
- staip.textContent=s.wifi.sta_ip; ap.textContent=s.wifi.ap_ssid; apip.textContent=s.wifi.ap_ip;
- sd.textContent=s.sd.mounted?'Mounted':'Not mounted'; sd.className='value '+(s.sd.mounted?'ok':'bad'); sdinfo.textContent=`${s.sd.type} ${s.sd.size_mb} MB`;
- adc0.textContent=s.adc[0]+' mV'; adc1.textContent=s.adc[1]+' mV'; adc2.textContent=s.adc[2]+' mV';
- rs485.textContent=s.rs485.mode; rs485.className='value '+(s.rs485.ok?'ok':'bad'); rs485t.textContent=s.rs485.mode==='send'?`total ${s.rs485.total} B`:`total ${s.rs485.total} B | crc error ${s.rs485.crc_errors} | seq error ${s.rs485.sequence_errors}`;
- can.textContent=s.can.mode; can.className='value '+(s.can.ok?'ok':'bad'); cant.textContent=`total ${s.can.total} B | bus error ${s.can.bus_errors}`;
+ time.textContent=s.time; timeage.textContent=`updated ${s.time_age_seconds} s ago`; sta.textContent=s.wifi.sta?s.wifi.sta_ssid:'Connecting'; sta.className='value '+(s.wifi.sta?'ok':'bad');
+ staip.textContent=s.wifi.sta?`${s.wifi.sta_ip} | RSSI ${s.wifi.sta_rssi} dBm`:s.wifi.sta_ip; ap.textContent=s.wifi.ap_ssid; apip.textContent=s.wifi.ap_ip;
+ sd.textContent=s.sd.mounted?'Detected':'Not detected'; sd.className='value '+(s.sd.mounted?'ok':'bad'); sdinfo.textContent=`name ${s.sd.name} | ${s.sd.type} | ${s.sd.size_mb} MB | sector ${s.sd.sector_size} B | count ${s.sd.sector_count} | ${s.sd.error}`;
+ adc.innerHTML=`ADC1: ${s.adc[0]} mV<br>ADC2: ${s.adc[1]} mV<br>ADC3: ${s.adc[2]} mV`;
+ const rs485Mode=s.rs485.mode.charAt(0).toUpperCase()+s.rs485.mode.slice(1);
+ const canMode=s.can.mode.charAt(0).toUpperCase()+s.can.mode.slice(1);
+ rs485.textContent=rs485Mode; rs485.className='value '+(s.rs485.ok?'ok':'bad'); rs485t.textContent=s.rs485.mode==='send'?`total ${s.rs485.total} B`:`total ${s.rs485.total} B | crc error ${s.rs485.crc_errors} | seq error ${s.rs485.sequence_errors}`;
+ can.textContent=canMode; can.className='value '+(s.can.ok?'ok':'bad'); cant.textContent=`total ${s.can.total} B | bus error ${s.can.bus_errors}`;
 }
 setInterval(refresh,1000);refresh();
 </script>
@@ -1102,9 +1161,9 @@ esp_err_t RootHandler(httpd_req_t* request)
 
 esp_err_t StatusHandler(httpd_req_t* request)
 {
-  const std::string json = StatusJson();
+  const char* json = StatusJson();
   httpd_resp_set_type(request, "application/json");
-  return httpd_resp_send(request, json.c_str(), json.size());
+  return httpd_resp_send(request, json, HTTPD_RESP_USE_STRLEN);
 }
 
 TestMode ParseMode(const char* mode)
@@ -1144,6 +1203,7 @@ esp_err_t SetHandler(httpd_req_t* request)
 void StartHttpServer()
 {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.stack_size = 8192;
 
   httpd_handle_t server = nullptr;
   ESP_ERROR_CHECK(httpd_start(&server, &config));
@@ -1174,8 +1234,13 @@ extern "C" void app_main(void)
   printf("Ciallo\n");
   InitAdcLed();
   InitWifi();
+  UpdateTimeText();
   StartHttpServer();
 
+  xTaskCreate(TimeTask, "time_task", kTaskStackSize, nullptr, kTaskPriority,
+              nullptr);
+  xTaskCreate(WifiInfoTask, "wifi_info_task", kTaskStackSize, nullptr,
+              kTaskPriority, nullptr);
   xTaskCreate(Ws2812Task, "ws2812_task", kTaskStackSize, nullptr,
               kTaskPriority, nullptr);
   xTaskCreate(AdcTask, "adc_task", kTaskStackSize, nullptr, kTaskPriority,
@@ -1188,7 +1253,7 @@ extern "C" void app_main(void)
               nullptr);
 
   printf("HTTP control center: connect AP %s password %s, open http://%s\n",
-         kWifiApSsid, kWifiApPassword, g_ap_ip);
+         g_ap_ssid, kWifiApPassword, g_ap_ip);
   while (true) {
     vTaskDelay(pdMS_TO_TICKS(1000));
   }

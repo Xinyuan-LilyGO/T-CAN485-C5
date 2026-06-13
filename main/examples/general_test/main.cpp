@@ -12,6 +12,7 @@
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <vector>
 
 #include "driver/gpio.h"
 #include "driver/sdspi_host.h"
@@ -65,7 +66,16 @@ constexpr uart_port_t kRs485UartPort = UART_NUM_1;
 constexpr int kRs485BaudRate = 115200;
 constexpr int kRs485RxBufferSize = 4096;
 constexpr int kRs485TxBufferSize = 4096;
-constexpr int kRs485PacketSize = 1024;
+constexpr int kRs485PayloadSize = 240;
+constexpr uint8_t kRs485Header0 = 0xAA;
+constexpr uint8_t kRs485Header1 = 0x55;
+constexpr size_t kRs485HeaderSize = 2;
+constexpr size_t kRs485SequenceSize = 4;
+constexpr size_t kRs485LengthSize = 2;
+constexpr size_t kRs485CrcSize = 2;
+constexpr size_t kRs485PacketOverhead = kRs485HeaderSize + kRs485SequenceSize +
+                                        kRs485LengthSize + kRs485CrcSize;
+constexpr size_t kRs485PacketSize = kRs485PacketOverhead + kRs485PayloadSize;
 constexpr int kRs485TxDoneWaitMs = 20;
 constexpr char kRs485TestChar = 'R';
 
@@ -130,10 +140,17 @@ char g_ap_ip[16] = "192.168.4.1";
 size_t g_rs485_total_size = 0;
 size_t g_rs485_bytes_this_time = 0;
 bool g_rs485_data_ok = true;
+uint32_t g_rs485_crc_error_count = 0;
+uint32_t g_rs485_sequence_error_count = 0;
+uint32_t g_rs485_tx_sequence = 0;
+uint32_t g_rs485_expected_sequence = 0;
+bool g_rs485_has_expected_sequence = false;
+std::vector<uint8_t> g_rs485_rx_stream;
 
 size_t g_can_total_size = 0;
 size_t g_can_bytes_this_time = 0;
 bool g_can_data_ok = true;
+uint32_t g_can_bus_error_count = 0;
 char g_can_state_text[24] = "off";
 
 bool g_sd_spi_bus_ready = false;
@@ -153,7 +170,7 @@ const char* ModeName(TestMode mode)
     case TestMode::kReceive:
       return "receive";
     default:
-      return "off";
+      return "stop";
   }
 }
 
@@ -426,17 +443,132 @@ void SdTask(void* param)
   }
 }
 
-bool ValidateData(const char* tag, const uint8_t* data, size_t len,
-                  uint8_t expected_char)
+uint16_t Crc16Modbus(const uint8_t* data, size_t len)
 {
+  uint16_t crc = 0xFFFF;
   for (size_t i = 0; i < len; ++i) {
-    if (data[i] != expected_char) {
-      printf("[%s] data corruption offset=%zu expected=0x%02X got=0x%02X\n",
-             tag, i, expected_char, data[i]);
-      return false;
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; ++bit) {
+      if ((crc & 0x0001) != 0) {
+        crc = static_cast<uint16_t>((crc >> 1) ^ 0xA001);
+      } else {
+        crc = static_cast<uint16_t>(crc >> 1);
+      }
     }
   }
-  return true;
+  return crc;
+}
+
+void WriteLe16(uint8_t* data, uint16_t value)
+{
+  data[0] = static_cast<uint8_t>(value & 0xFF);
+  data[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+}
+
+void WriteLe32(uint8_t* data, uint32_t value)
+{
+  data[0] = static_cast<uint8_t>(value & 0xFF);
+  data[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+  data[2] = static_cast<uint8_t>((value >> 16) & 0xFF);
+  data[3] = static_cast<uint8_t>((value >> 24) & 0xFF);
+}
+
+uint16_t ReadLe16(const uint8_t* data)
+{
+  return static_cast<uint16_t>(data[0]) |
+         (static_cast<uint16_t>(data[1]) << 8);
+}
+
+uint32_t ReadLe32(const uint8_t* data)
+{
+  return static_cast<uint32_t>(data[0]) |
+         (static_cast<uint32_t>(data[1]) << 8) |
+         (static_cast<uint32_t>(data[2]) << 16) |
+         (static_cast<uint32_t>(data[3]) << 24);
+}
+
+std::array<uint8_t, kRs485PacketSize> BuildRs485Packet(uint32_t sequence)
+{
+  std::array<uint8_t, kRs485PacketSize> packet = {};
+  packet[0] = kRs485Header0;
+  packet[1] = kRs485Header1;
+  WriteLe32(&packet[2], sequence);
+  WriteLe16(&packet[6], kRs485PayloadSize);
+  for (size_t i = 0; i < kRs485PayloadSize; ++i) {
+    packet[8 + i] = kRs485TestChar;
+  }
+  const uint16_t crc = Crc16Modbus(&packet[2],
+                                   kRs485SequenceSize + kRs485LengthSize +
+                                       kRs485PayloadSize);
+  WriteLe16(&packet[8 + kRs485PayloadSize], crc);
+  return packet;
+}
+
+size_t ProcessRs485Stream(const uint8_t* data, size_t len)
+{
+  g_rs485_rx_stream.insert(g_rs485_rx_stream.end(), data, data + len);
+  size_t valid_payload_size = 0;
+
+  while (g_rs485_rx_stream.size() >= kRs485PacketOverhead) {
+    size_t header_pos = 0;
+    while (header_pos + 1 < g_rs485_rx_stream.size() &&
+           (g_rs485_rx_stream[header_pos] != kRs485Header0 ||
+            g_rs485_rx_stream[header_pos + 1] != kRs485Header1)) {
+      ++header_pos;
+    }
+    if (header_pos > 0) {
+      g_rs485_rx_stream.erase(g_rs485_rx_stream.begin(),
+                              g_rs485_rx_stream.begin() + header_pos);
+    }
+    if (g_rs485_rx_stream.size() < kRs485PacketOverhead) {
+      break;
+    }
+    if (g_rs485_rx_stream[0] != kRs485Header0 ||
+        g_rs485_rx_stream[1] != kRs485Header1) {
+      break;
+    }
+
+    const uint16_t payload_len = ReadLe16(&g_rs485_rx_stream[6]);
+    if (payload_len == 0 || payload_len > kRs485PayloadSize) {
+      g_rs485_data_ok = false;
+      g_rs485_rx_stream.erase(g_rs485_rx_stream.begin());
+      continue;
+    }
+
+    const size_t packet_size = kRs485PacketOverhead + payload_len;
+    if (g_rs485_rx_stream.size() < packet_size) {
+      break;
+    }
+
+    const uint32_t sequence = ReadLe32(&g_rs485_rx_stream[2]);
+    const uint16_t expected_crc =
+        ReadLe16(&g_rs485_rx_stream[8 + payload_len]);
+    const uint16_t actual_crc =
+        Crc16Modbus(&g_rs485_rx_stream[2],
+                    kRs485SequenceSize + kRs485LengthSize + payload_len);
+    if (actual_crc != expected_crc) {
+      ++g_rs485_crc_error_count;
+      g_rs485_data_ok = false;
+      g_rs485_rx_stream.erase(g_rs485_rx_stream.begin(),
+                              g_rs485_rx_stream.begin() + packet_size);
+      continue;
+    }
+
+    if (g_rs485_has_expected_sequence &&
+        sequence != g_rs485_expected_sequence) {
+      ++g_rs485_sequence_error_count;
+      g_rs485_data_ok = false;
+    }
+    g_rs485_expected_sequence = sequence + 1;
+    g_rs485_has_expected_sequence = true;
+
+    valid_payload_size += payload_len;
+
+    g_rs485_rx_stream.erase(g_rs485_rx_stream.begin(),
+                            g_rs485_rx_stream.begin() + packet_size);
+  }
+
+  return valid_payload_size;
 }
 
 bool InitRs485()
@@ -475,7 +607,6 @@ void Rs485Task(void* param)
   TestMode active_mode = TestMode::kOff;
   bool initialized = false;
   uint32_t last_print_ms = 0;
-  std::string payload(kRs485PacketSize, kRs485TestChar);
 
   while (true) {
     const TestMode requested_mode = g_rs485_mode;
@@ -485,10 +616,16 @@ void Rs485Task(void* param)
         initialized = false;
       }
       active_mode = requested_mode;
-      g_rs485_total_size = 0;
-      g_rs485_bytes_this_time = 0;
-      g_rs485_data_ok = true;
       if (active_mode != TestMode::kOff) {
+        g_rs485_total_size = 0;
+        g_rs485_bytes_this_time = 0;
+        g_rs485_data_ok = true;
+        g_rs485_crc_error_count = 0;
+        g_rs485_sequence_error_count = 0;
+        g_rs485_tx_sequence = 0;
+        g_rs485_expected_sequence = 0;
+        g_rs485_has_expected_sequence = false;
+        g_rs485_rx_stream.clear();
         initialized = InitRs485();
         printf("[rs485] mode=%s init=%s\n", ModeName(active_mode),
                initialized ? "ok" : "failed");
@@ -501,8 +638,9 @@ void Rs485Task(void* param)
     }
 
     if (active_mode == TestMode::kSend) {
-      const int len = uart_write_bytes(kRs485UartPort, payload.data(),
-                                       payload.size());
+      const auto packet = BuildRs485Packet(g_rs485_tx_sequence++);
+      const int len = uart_write_bytes(kRs485UartPort, packet.data(),
+                                       packet.size());
       if (len > 0) {
         uart_wait_tx_done(kRs485UartPort, pdMS_TO_TICKS(kRs485TxDoneWaitMs));
         g_rs485_bytes_this_time += len;
@@ -516,25 +654,26 @@ void Rs485Task(void* param)
         const int read_len =
             uart_read_bytes(kRs485UartPort, buffer.data(), rx_len,
                             pdMS_TO_TICKS(20));
-        if (read_len > 0 &&
-            ValidateData("rs485 receive",
-                         reinterpret_cast<const uint8_t*>(buffer.data()),
-                         read_len, kRs485TestChar)) {
-          g_rs485_bytes_this_time += read_len;
-          g_rs485_total_size += read_len;
-        } else if (read_len > 0) {
-          g_rs485_data_ok = false;
+        if (read_len > 0) {
+          const size_t valid_size = ProcessRs485Stream(
+              reinterpret_cast<const uint8_t*>(buffer.data()), read_len);
+          g_rs485_bytes_this_time += valid_size;
+          g_rs485_total_size += valid_size;
         }
       }
     }
 
     const uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
     if (now - last_print_ms >= kPrintIntervalMs) {
-      printf("[rs485 %s] size=%.2f KB total=%.2f KB ok=%d\n",
-             ModeName(active_mode),
-             static_cast<float>(g_rs485_bytes_this_time) / 1024.0f,
-             static_cast<float>(g_rs485_total_size) / 1024.0f,
-             g_rs485_data_ok ? 1 : 0);
+      if (active_mode == TestMode::kSend) {
+        printf("[rs485 %s] total %zu B\n", ModeName(active_mode),
+               g_rs485_total_size);
+      } else {
+        printf("[rs485 %s] total %zu B | crc error %lu | seq error %lu\n",
+               ModeName(active_mode), g_rs485_total_size,
+               static_cast<unsigned long>(g_rs485_crc_error_count),
+               static_cast<unsigned long>(g_rs485_sequence_error_count));
+      }
       g_rs485_bytes_this_time = 0;
       last_print_ms = now;
     }
@@ -672,6 +811,7 @@ void ServiceCanState()
   if (twai_node_get_info(g_can_node, &status, &record) != ESP_OK) {
     return;
   }
+  g_can_bus_error_count = record.bus_err_num;
   std::snprintf(g_can_state_text, sizeof(g_can_state_text), "%s",
                 CanStateName(status.state));
 
@@ -706,10 +846,11 @@ void CanTask(void* param)
         initialized = false;
       }
       active_mode = requested_mode;
-      g_can_total_size = 0;
-      g_can_bytes_this_time = 0;
-      g_can_data_ok = true;
       if (active_mode != TestMode::kOff) {
+        g_can_total_size = 0;
+        g_can_bytes_this_time = 0;
+        g_can_data_ok = true;
+        g_can_bus_error_count = 0;
         initialized = InitCan();
         printf("[can] mode=%s init=%s\n", ModeName(active_mode),
                initialized ? "ok" : "failed");
@@ -748,9 +889,7 @@ void CanTask(void* param)
         ++receive_count;
         if (!rx_frame.is_remote && !rx_frame.is_extended &&
             rx_frame.id == kCanTestId &&
-            rx_frame.data_length == kCanDataLength &&
-            ValidateData("can receive", rx_frame.data, rx_frame.data_length,
-                         kCanTestChar)) {
+            rx_frame.data_length == kCanDataLength) {
           g_can_bytes_this_time += rx_frame.data_length;
           g_can_total_size += rx_frame.data_length;
         } else {
@@ -762,11 +901,10 @@ void CanTask(void* param)
 
     const uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
     if (now - last_print_ms >= kPrintIntervalMs) {
-      printf("[can %s] size=%.2f KB total=%.2f KB state=%s ok=%d\n",
-             ModeName(active_mode),
-             static_cast<float>(g_can_bytes_this_time) / 1024.0f,
-             static_cast<float>(g_can_total_size) / 1024.0f,
-             g_can_state_text, g_can_data_ok ? 1 : 0);
+      printf("[can %s] total %zu B | bus error %lu | state %s\n",
+             ModeName(active_mode), g_can_total_size,
+             static_cast<unsigned long>(g_can_bus_error_count),
+             g_can_state_text);
       g_can_bytes_this_time = 0;
       last_print_ms = now;
     }
@@ -882,17 +1020,22 @@ std::string StatusJson()
       "\"ap_ip\":\"%s\"},"
       "\"sd\":{\"mounted\":%s,\"type\":\"%s\",\"size_mb\":%llu},"
       "\"adc\":[%d,%d,%d],"
-      "\"rs485\":{\"mode\":\"%s\",\"total\":%u,\"ok\":%s},"
-      "\"can\":{\"mode\":\"%s\",\"total\":%u,\"ok\":%s,\"state\":\"%s\"}"
+      "\"rs485\":{\"mode\":\"%s\",\"total\":%u,\"ok\":%s,"
+      "\"crc_errors\":%lu,\"sequence_errors\":%lu},"
+      "\"can\":{\"mode\":\"%s\",\"total\":%u,\"ok\":%s,\"state\":\"%s\","
+      "\"bus_errors\":%lu}"
       "}",
       time_text.c_str(), g_wifi_sta_connected ? "true" : "false", g_sta_ip,
       kWifiApSsid, g_ap_ip, g_sd_mounted ? "true" : "false", g_sd_type,
       static_cast<unsigned long long>(g_sd_size_mb), g_adc_mv[0],
       g_adc_mv[1], g_adc_mv[2], ModeName(rs485_mode),
       static_cast<unsigned>(g_rs485_total_size),
-      g_rs485_data_ok ? "true" : "false", ModeName(can_mode),
+      g_rs485_data_ok ? "true" : "false",
+      static_cast<unsigned long>(g_rs485_crc_error_count),
+      static_cast<unsigned long>(g_rs485_sequence_error_count),
+      ModeName(can_mode),
       static_cast<unsigned>(g_can_total_size), g_can_data_ok ? "true" : "false",
-      g_can_state_text);
+      g_can_state_text, static_cast<unsigned long>(g_can_bus_error_count));
   return buffer;
 }
 
@@ -930,8 +1073,8 @@ button.active{background:#1f8f5f;border-color:#32b878}
 <div class="card"><div class="label">ADC 3</div><div class="value" id="adc2">-</div></div>
 </section>
 <section class="grid">
-<div class="card"><div class="label">RS485</div><div class="value" id="rs485">-</div><div class="small" id="rs485t"></div><div class="row"><button onclick="setMode('rs485','send')">Send</button><button onclick="setMode('rs485','receive')">Receive</button><button onclick="setMode('rs485','off')">Off</button></div></div>
-<div class="card"><div class="label">CAN</div><div class="value" id="can">-</div><div class="small" id="cant"></div><div class="row"><button onclick="setMode('can','send')">Send</button><button onclick="setMode('can','receive')">Receive</button><button onclick="setMode('can','off')">Off</button></div></div>
+<div class="card"><div class="label">RS485</div><div class="value" id="rs485">-</div><div class="small" id="rs485t"></div><div class="row"><button onclick="setMode('rs485','send')">Send</button><button onclick="setMode('rs485','receive')">Receive</button><button onclick="setMode('rs485','stop')">Stop</button></div></div>
+<div class="card"><div class="label">CAN</div><div class="value" id="can">-</div><div class="small" id="cant"></div><div class="row"><button onclick="setMode('can','send')">Send</button><button onclick="setMode('can','receive')">Receive</button><button onclick="setMode('can','stop')">Stop</button></div></div>
 </section>
 </main>
 <script>
@@ -942,8 +1085,8 @@ async function refresh(){
  staip.textContent=s.wifi.sta_ip; ap.textContent=s.wifi.ap_ssid; apip.textContent=s.wifi.ap_ip;
  sd.textContent=s.sd.mounted?'Mounted':'Not mounted'; sd.className='value '+(s.sd.mounted?'ok':'bad'); sdinfo.textContent=`${s.sd.type} ${s.sd.size_mb} MB`;
  adc0.textContent=s.adc[0]+' mV'; adc1.textContent=s.adc[1]+' mV'; adc2.textContent=s.adc[2]+' mV';
- rs485.textContent=s.rs485.mode; rs485.className='value '+(s.rs485.ok?'ok':'bad'); rs485t.textContent=`total ${s.rs485.total} B`;
- can.textContent=s.can.mode+' / '+s.can.state; can.className='value '+(s.can.ok?'ok':'bad'); cant.textContent=`total ${s.can.total} B`;
+ rs485.textContent=s.rs485.mode; rs485.className='value '+(s.rs485.ok?'ok':'bad'); rs485t.textContent=s.rs485.mode==='send'?`total ${s.rs485.total} B`:`total ${s.rs485.total} B | crc error ${s.rs485.crc_errors} | seq error ${s.rs485.sequence_errors}`;
+ can.textContent=s.can.mode; can.className='value '+(s.can.ok?'ok':'bad'); cant.textContent=`total ${s.can.total} B | bus error ${s.can.bus_errors}`;
 }
 setInterval(refresh,1000);refresh();
 </script>
@@ -971,6 +1114,9 @@ TestMode ParseMode(const char* mode)
   }
   if (std::strcmp(mode, "receive") == 0) {
     return TestMode::kReceive;
+  }
+  if (std::strcmp(mode, "stop") == 0) {
+    return TestMode::kOff;
   }
   return TestMode::kOff;
 }

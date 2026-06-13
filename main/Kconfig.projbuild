@@ -2,7 +2,7 @@ menu "Example Configuration"
 
     choice
         prompt "Select the example to build"
-        default EXAMPLE_BUILD_WS2812
+        default EXAMPLE_BUILD_GENERAL_TEST
             config EXAMPLE_BUILD_WS2812
                 bool "ws2812"
             config EXAMPLE_BUILD_SD
@@ -11,6 +11,8 @@ menu "Example Configuration"
                 bool "adc"
             config EXAMPLE_BUILD_RS485_CAN
                 bool "rs485_can"
+            config EXAMPLE_BUILD_GENERAL_TEST
+                bool "general_test"
     endchoice
 
 endmenu

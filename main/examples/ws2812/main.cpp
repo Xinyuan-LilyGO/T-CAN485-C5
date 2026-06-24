@@ -21,6 +21,7 @@ namespace {
 namespace t_can485_c5 = lilygo_device_driver::t_can485_c5;
 
 static const char* const kTag = "ws2812";
+constexpr int kWs2812ResolutionHz = 10 * 1000 * 1000;
 constexpr uint8_t kBrightness = 32;
 
 struct Rgb {
@@ -45,7 +46,7 @@ esp_err_t InitWs2812(led_strip_handle_t* led_strip)
 
   led_strip_rmt_config_t rmt_config = {};
   rmt_config.clk_src = RMT_CLK_SRC_DEFAULT;
-  rmt_config.resolution_hz = t_can485_c5::device::ws2812::kResolutionHz;
+  rmt_config.resolution_hz = kWs2812ResolutionHz;
   rmt_config.mem_block_symbols = 64;
 
   ESP_RETURN_ON_ERROR(

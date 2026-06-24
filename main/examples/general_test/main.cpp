@@ -95,6 +95,7 @@ constexpr int kCanBitrate = 1000000;
 constexpr int kCanTxQueueDepth = 16;
 constexpr int kCanRxQueueDepth = 32;
 
+constexpr int kWs2812ResolutionHz = 10 * 1000 * 1000;
 constexpr uint8_t kWs2812Brightness = 32;
 constexpr int kWs2812PeriodMs = 1000;
 constexpr int kPrintIntervalMs = 3000;
@@ -211,9 +212,9 @@ uint8_t ScaleColor(uint8_t value)
 void InitAdcLed()
 {
   const uint64_t pin_mask =
-      (1ULL << t_can485_c5::gpio::led::kRed) |
-      (1ULL << t_can485_c5::gpio::led::kGreen) |
-      (1ULL << t_can485_c5::gpio::led::kBlue);
+      (1ULL << t_can485_c5::gpio::led::kNumber1) |
+      (1ULL << t_can485_c5::gpio::led::kNumber2) |
+      (1ULL << t_can485_c5::gpio::led::kNumber3);
 
   gpio_config_t config = {};
   config.pin_bit_mask = pin_mask;
@@ -223,11 +224,11 @@ void InitAdcLed()
   config.intr_type = GPIO_INTR_DISABLE;
   ESP_ERROR_CHECK(gpio_config(&config));
   ESP_ERROR_CHECK(gpio_set_level(
-      static_cast<gpio_num_t>(t_can485_c5::gpio::led::kRed), 0));
+      static_cast<gpio_num_t>(t_can485_c5::gpio::led::kNumber1), 0));
   ESP_ERROR_CHECK(gpio_set_level(
-      static_cast<gpio_num_t>(t_can485_c5::gpio::led::kGreen), 0));
+      static_cast<gpio_num_t>(t_can485_c5::gpio::led::kNumber2), 0));
   ESP_ERROR_CHECK(gpio_set_level(
-      static_cast<gpio_num_t>(t_can485_c5::gpio::led::kBlue), 0));
+      static_cast<gpio_num_t>(t_can485_c5::gpio::led::kNumber3), 0));
 }
 
 esp_err_t InitWs2812(led_strip_handle_t* led_strip)
@@ -240,7 +241,7 @@ esp_err_t InitWs2812(led_strip_handle_t* led_strip)
 
   led_strip_rmt_config_t rmt_config = {};
   rmt_config.clk_src = RMT_CLK_SRC_DEFAULT;
-  rmt_config.resolution_hz = t_can485_c5::device::ws2812::kResolutionHz;
+  rmt_config.resolution_hz = kWs2812ResolutionHz;
   rmt_config.mem_block_symbols = 64;
   return led_strip_new_rmt_device(&strip_config, &rmt_config, led_strip);
 }

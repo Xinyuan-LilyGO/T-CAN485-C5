@@ -2,7 +2,7 @@
  * @Description: General board test
  * @Author: LILYGO_L
  * @Date: 2026-06-12 17:30:00
- * @LastEditTime: 2026-06-13 14:25:44
+ * @LastEditTime: 2026-08-27 12:00:00
  * @License: GPL 3.0
  */
 
@@ -17,11 +17,15 @@
 #include "driver/gpio.h"
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
+#include "driver/spi_master.h"
 #include "driver/uart.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_err.h"
+#include "esp_eth.h"
+#include "esp_eth_mac_spi.h"
+#include "esp_eth_phy.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_mac.h"
@@ -42,6 +46,12 @@
 #include "sd_protocol_defs.h"
 #include "sdmmc_cmd.h"
 
+extern "C" esp_err_t __wrap_sdmmc_init_spi_crc(sdmmc_card_t* card)
+{
+  (void)card;
+  return ESP_OK;
+}
+
 namespace {
 
 namespace t_can485_c5 = lilygo_device_driver::t_can485_c5;
@@ -56,8 +66,19 @@ constexpr int kWifiInfoPeriodMs = 1000;
 constexpr int kTimeUpdatePeriodMs = 20000;
 
 constexpr char kMountPoint[] = "/sdcard";
-constexpr int kSdPollPeriodMs = 3000;
+constexpr int kSdStatusPollPeriodMs = 3000;
+constexpr int kSdRetryPeriodMs = 5000;
 constexpr int kSdSpiMaxFreqKhz = 10000;
+
+constexpr spi_host_device_t kSharedSpiHost = SPI2_HOST;
+constexpr int kW5500SpiClockMhz = 10;
+constexpr int kW5500RxTaskStackSize = 4096;
+constexpr int kW5500ResetAssertMs = 10;
+constexpr int kW5500ResetRecoveryMs = 100;
+
+constexpr int kDigitalInputPollPeriodMs = 20;
+constexpr int kButtonPollPeriodMs = 20;
+constexpr int kButtonDebounceSamples = 3;
 
 constexpr adc_atten_t kAdcAtten = ADC_ATTEN_DB_12;
 constexpr adc_bitwidth_t kAdcBitwidth = ADC_BITWIDTH_12;
@@ -97,7 +118,6 @@ constexpr int kCanRxQueueDepth = 32;
 
 constexpr int kWs2812ResolutionHz = 10 * 1000 * 1000;
 constexpr uint8_t kWs2812Brightness = 32;
-constexpr int kWs2812PeriodMs = 1000;
 constexpr int kPrintIntervalMs = 3000;
 constexpr int kTaskStackSize = 6 * 1024;
 constexpr UBaseType_t kTaskPriority = 5;
@@ -114,12 +134,35 @@ struct Rgb {
   uint8_t blue;
 };
 
+constexpr std::array<Rgb, 5> kWs2812Colors = {
+    Rgb{255, 0, 0},
+    Rgb{0, 255, 0},
+    Rgb{0, 0, 255},
+    Rgb{255, 255, 255},
+    Rgb{0, 0, 0},
+};
+constexpr std::array<const char*, 5> kWs2812ColorNames = {
+    "red", "green", "blue", "white", "black",
+};
+constexpr size_t kWs2812InitialColorIndex = kWs2812Colors.size() - 1;
+
 struct AdcInput {
   const char* name;
   int gpio;
   adc_unit_t unit = ADC_UNIT_1;
   adc_channel_t channel = ADC_CHANNEL_0;
   adc_cali_handle_t calibration = nullptr;
+};
+
+struct EthernetState {
+  volatile bool started = false;
+  volatile bool link_up = false;
+  volatile bool has_ip = false;
+  char mac[18] = "00:00:00:00:00:00";
+  char ip[16] = "0.0.0.0";
+  char netmask[16] = "0.0.0.0";
+  char gateway[16] = "0.0.0.0";
+  char dns[16] = "0.0.0.0";
 };
 
 struct CanRxFrame {
@@ -134,7 +177,10 @@ volatile TestMode g_rs485_mode = TestMode::kOff;
 volatile TestMode g_can_mode = TestMode::kOff;
 volatile bool g_wifi_sta_connected = false;
 
-int g_adc_mv[3] = {};
+int g_adc_pin_mv = -1;
+int g_adc_input_mv = -1;
+volatile bool g_digital_input_active = false;
+volatile bool g_boot_button_pressed = false;
 bool g_sd_mounted = false;
 uint64_t g_sd_size_mb = 0;
 uint32_t g_sd_sector_size = 0;
@@ -149,7 +195,11 @@ char g_ap_ip[16] = "192.168.4.1";
 char g_ap_ssid[33] = "T-CAN485-C5";
 char g_time_text[32] = "syncing";
 uint32_t g_time_age_seconds = 0;
-char g_status_json[2048] = {};
+char g_status_json[3072] = {};
+
+EthernetState g_ethernet;
+esp_eth_handle_t g_eth_handle = nullptr;
+esp_netif_t* g_eth_netif = nullptr;
 
 size_t g_rs485_total_size = 0;
 size_t g_rs485_bytes_this_time = 0;
@@ -167,13 +217,16 @@ bool g_can_data_ok = true;
 uint32_t g_can_bus_error_count = 0;
 char g_can_state_text[24] = "off";
 
-bool g_sd_spi_bus_ready = false;
+bool g_shared_spi_bus_ready = false;
+sdmmc_card_t* g_sd_card = nullptr;
 twai_node_handle_t g_can_node = nullptr;
 QueueHandle_t g_can_rx_queue = nullptr;
 volatile uint32_t g_can_error_flags = 0;
 volatile twai_error_state_t g_can_state = TWAI_ERROR_ACTIVE;
 volatile bool g_can_recovering = false;
 int64_t g_can_last_recover_us = 0;
+led_strip_handle_t g_ws2812 = nullptr;
+size_t g_ws2812_color_index = kWs2812InitialColorIndex;
 
 const char* ModeName(TestMode mode)
 {
@@ -209,29 +262,21 @@ uint8_t ScaleColor(uint8_t value)
       (static_cast<uint16_t>(value) * kWs2812Brightness) / UINT8_MAX);
 }
 
-void InitAdcLed()
+esp_err_t SetWs2812Color(const Rgb& color)
 {
-  const uint64_t pin_mask =
-      (1ULL << t_can485_c5::gpio::led::kNumber1) |
-      (1ULL << t_can485_c5::gpio::led::kNumber2) |
-      (1ULL << t_can485_c5::gpio::led::kNumber3);
-
-  gpio_config_t config = {};
-  config.pin_bit_mask = pin_mask;
-  config.mode = GPIO_MODE_OUTPUT;
-  config.pull_up_en = GPIO_PULLUP_DISABLE;
-  config.pull_down_en = GPIO_PULLDOWN_DISABLE;
-  config.intr_type = GPIO_INTR_DISABLE;
-  ESP_ERROR_CHECK(gpio_config(&config));
-  ESP_ERROR_CHECK(gpio_set_level(
-      static_cast<gpio_num_t>(t_can485_c5::gpio::led::kNumber1), 0));
-  ESP_ERROR_CHECK(gpio_set_level(
-      static_cast<gpio_num_t>(t_can485_c5::gpio::led::kNumber2), 0));
-  ESP_ERROR_CHECK(gpio_set_level(
-      static_cast<gpio_num_t>(t_can485_c5::gpio::led::kNumber3), 0));
+  if (g_ws2812 == nullptr) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  esp_err_t err = led_strip_set_pixel(g_ws2812, 0, ScaleColor(color.red),
+                                      ScaleColor(color.green),
+                                      ScaleColor(color.blue));
+  if (err != ESP_OK) {
+    return err;
+  }
+  return led_strip_refresh(g_ws2812);
 }
 
-esp_err_t InitWs2812(led_strip_handle_t* led_strip)
+esp_err_t InitWs2812()
 {
   led_strip_config_t strip_config = {};
   strip_config.strip_gpio_num = t_can485_c5::gpio::ws2812::kData;
@@ -243,35 +288,29 @@ esp_err_t InitWs2812(led_strip_handle_t* led_strip)
   rmt_config.clk_src = RMT_CLK_SRC_DEFAULT;
   rmt_config.resolution_hz = kWs2812ResolutionHz;
   rmt_config.mem_block_symbols = 64;
-  return led_strip_new_rmt_device(&strip_config, &rmt_config, led_strip);
-}
-
-void SetWs2812Color(led_strip_handle_t led_strip, const Rgb& color)
-{
-  ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, ScaleColor(color.red),
-                                      ScaleColor(color.green),
-                                      ScaleColor(color.blue)));
-  ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-}
-
-void Ws2812Task(void* param)
-{
-  (void)param;
-  led_strip_handle_t led_strip = nullptr;
-  ESP_ERROR_CHECK(InitWs2812(&led_strip));
-  constexpr std::array<Rgb, 4> kColors = {
-      Rgb{255, 0, 0},
-      Rgb{0, 255, 0},
-      Rgb{0, 0, 255},
-      Rgb{255, 255, 255},
-  };
-
-  while (true) {
-    for (const auto& color : kColors) {
-      SetWs2812Color(led_strip, color);
-      vTaskDelay(pdMS_TO_TICKS(kWs2812PeriodMs));
-    }
+  esp_err_t err =
+      led_strip_new_rmt_device(&strip_config, &rmt_config, &g_ws2812);
+  if (err != ESP_OK) {
+    return err;
   }
+  g_ws2812_color_index = kWs2812InitialColorIndex;
+  return SetWs2812Color(kWs2812Colors[g_ws2812_color_index]);
+}
+
+esp_err_t NextWs2812Color()
+{
+  const size_t next_color_index =
+      (g_ws2812_color_index + 1) % kWs2812Colors.size();
+  const esp_err_t err = SetWs2812Color(kWs2812Colors[next_color_index]);
+  if (err == ESP_OK) {
+    g_ws2812_color_index = next_color_index;
+  }
+  return err;
+}
+
+const char* Ws2812ColorName()
+{
+  return kWs2812ColorNames[g_ws2812_color_index];
 }
 
 bool InitCalibration(const AdcInput& input, adc_cali_handle_t* calibration)
@@ -326,6 +365,13 @@ int ReadVoltage(adc_oneshot_unit_handle_t adc_handle, const AdcInput& input)
   return raw * kAdcApproxMaxVoltageMv / kAdcMaxRaw;
 }
 
+int ScaleInputVoltage(int adc_voltage_mv)
+{
+  return adc_voltage_mv *
+         t_can485_c5::device::adc::kInputScaleNumerator /
+         t_can485_c5::device::adc::kInputScaleDenominator;
+}
+
 void AdcTask(void* param)
 {
   (void)param;
@@ -334,45 +380,321 @@ void AdcTask(void* param)
   adc_oneshot_unit_handle_t adc_handle = nullptr;
   ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_config, &adc_handle));
 
-  std::array<AdcInput, 3> inputs = {
-      AdcInput{"ADC_1", t_can485_c5::gpio::adc::kChannel1},
-      AdcInput{"ADC_2", t_can485_c5::gpio::adc::kChannel2},
-      AdcInput{"ADC_3", t_can485_c5::gpio::adc::kChannel3},
-  };
-  for (auto& input : inputs) {
-    ESP_ERROR_CHECK(InitAdcInput(adc_handle, &input) ? ESP_OK : ESP_FAIL);
-  }
+  AdcInput input{"0-24V", t_can485_c5::gpio::adc::kVoltage};
+  ESP_ERROR_CHECK(InitAdcInput(adc_handle, &input) ? ESP_OK : ESP_FAIL);
 
   while (true) {
-    for (size_t i = 0; i < inputs.size(); ++i) {
-      g_adc_mv[i] = ReadVoltage(adc_handle, inputs[i]);
+    g_adc_pin_mv = ReadVoltage(adc_handle, input);
+    if (g_adc_pin_mv >= 0) {
+      g_adc_input_mv = ScaleInputVoltage(g_adc_pin_mv);
     }
     vTaskDelay(pdMS_TO_TICKS(kAdcReadPeriodMs));
   }
 }
 
-bool InitSdSpiBus()
+void InitDigitalInput()
 {
-  if (g_sd_spi_bus_ready) {
+  gpio_config_t config = {};
+  config.pin_bit_mask =
+      1ULL << t_can485_c5::gpio::digital_input::kOptocoupler;
+  config.mode = GPIO_MODE_INPUT;
+  config.pull_up_en = GPIO_PULLUP_DISABLE;
+  config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  config.intr_type = GPIO_INTR_DISABLE;
+  ESP_ERROR_CHECK(gpio_config(&config));
+}
+
+void DigitalInputTask(void* param)
+{
+  (void)param;
+  while (true) {
+    g_digital_input_active =
+        gpio_get_level(static_cast<gpio_num_t>(
+            t_can485_c5::gpio::digital_input::kOptocoupler)) ==
+        t_can485_c5::device::digital_input::kActiveLevel;
+    vTaskDelay(pdMS_TO_TICKS(kDigitalInputPollPeriodMs));
+  }
+}
+
+void InitBootButton()
+{
+  gpio_config_t config = {};
+  config.pin_bit_mask =
+      1ULL << t_can485_c5::gpio::button::kEsp32c5Boot;
+  config.mode = GPIO_MODE_INPUT;
+  config.pull_up_en = GPIO_PULLUP_ENABLE;
+  config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  config.intr_type = GPIO_INTR_DISABLE;
+  ESP_ERROR_CHECK(gpio_config(&config));
+  g_boot_button_pressed =
+      gpio_get_level(static_cast<gpio_num_t>(
+          t_can485_c5::gpio::button::kEsp32c5Boot)) == 0;
+}
+
+void ButtonTask(void* param)
+{
+  (void)param;
+  bool candidate = g_boot_button_pressed;
+  int candidate_count = 0;
+
+  while (true) {
+    const bool pressed =
+        gpio_get_level(static_cast<gpio_num_t>(
+            t_can485_c5::gpio::button::kEsp32c5Boot)) == 0;
+    if (pressed == candidate) {
+      ++candidate_count;
+    } else {
+      candidate = pressed;
+      candidate_count = 1;
+    }
+    if (candidate_count >= kButtonDebounceSamples) {
+      g_boot_button_pressed = candidate;
+      candidate_count = kButtonDebounceSamples;
+    }
+    vTaskDelay(pdMS_TO_TICKS(kButtonPollPeriodMs));
+  }
+}
+
+bool InitSharedSpiBus()
+{
+  if (g_shared_spi_bus_ready) {
     return true;
   }
 
+  gpio_config_t cs_config = {};
+  cs_config.pin_bit_mask =
+      (1ULL << t_can485_c5::gpio::sd::kCs) |
+      (1ULL << t_can485_c5::gpio::w5500::kCs);
+  cs_config.mode = GPIO_MODE_OUTPUT;
+  cs_config.pull_up_en = GPIO_PULLUP_DISABLE;
+  cs_config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  cs_config.intr_type = GPIO_INTR_DISABLE;
+  if (gpio_config(&cs_config) != ESP_OK ||
+      gpio_set_level(static_cast<gpio_num_t>(t_can485_c5::gpio::sd::kCs),
+                     1) != ESP_OK ||
+      gpio_set_level(
+          static_cast<gpio_num_t>(t_can485_c5::gpio::w5500::kCs), 1) !=
+          ESP_OK) {
+    return false;
+  }
+
   spi_bus_config_t bus_config = {};
-  bus_config.mosi_io_num = t_can485_c5::gpio::sd::kMosi;
-  bus_config.miso_io_num = t_can485_c5::gpio::sd::kMiso;
-  bus_config.sclk_io_num = t_can485_c5::gpio::sd::kSclk;
+  bus_config.mosi_io_num = t_can485_c5::gpio::spi::kMosi;
+  bus_config.miso_io_num = t_can485_c5::gpio::spi::kMiso;
+  bus_config.sclk_io_num = t_can485_c5::gpio::spi::kSclk;
   bus_config.quadwp_io_num = -1;
   bus_config.quadhd_io_num = -1;
   bus_config.max_transfer_sz = 4000;
 
-  sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-  esp_err_t err = spi_bus_initialize(static_cast<spi_host_device_t>(host.slot),
-                                     &bus_config, SDSPI_DEFAULT_DMA);
+  esp_err_t err =
+      spi_bus_initialize(kSharedSpiHost, &bus_config, SPI_DMA_CH_AUTO);
   if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
     return false;
   }
-  g_sd_spi_bus_ready = true;
+  g_shared_spi_bus_ready = true;
   return true;
+}
+
+void UpdateEthernetIpInfo()
+{
+  if (g_eth_netif == nullptr) {
+    return;
+  }
+
+  esp_netif_ip_info_t ip_info = {};
+  if (esp_netif_get_ip_info(g_eth_netif, &ip_info) == ESP_OK) {
+    std::snprintf(g_ethernet.ip, sizeof(g_ethernet.ip), IPSTR,
+                  IP2STR(&ip_info.ip));
+    std::snprintf(g_ethernet.netmask, sizeof(g_ethernet.netmask), IPSTR,
+                  IP2STR(&ip_info.netmask));
+    std::snprintf(g_ethernet.gateway, sizeof(g_ethernet.gateway), IPSTR,
+                  IP2STR(&ip_info.gw));
+  }
+
+  esp_netif_dns_info_t dns_info = {};
+  if (esp_netif_get_dns_info(g_eth_netif, ESP_NETIF_DNS_MAIN, &dns_info) ==
+          ESP_OK &&
+      dns_info.ip.type == ESP_IPADDR_TYPE_V4) {
+    std::snprintf(g_ethernet.dns, sizeof(g_ethernet.dns), IPSTR,
+                  IP2STR(&dns_info.ip.u_addr.ip4));
+  }
+}
+
+void ClearEthernetIpInfo()
+{
+  std::snprintf(g_ethernet.ip, sizeof(g_ethernet.ip), "%s", "0.0.0.0");
+  std::snprintf(g_ethernet.netmask, sizeof(g_ethernet.netmask), "%s",
+                "0.0.0.0");
+  std::snprintf(g_ethernet.gateway, sizeof(g_ethernet.gateway), "%s",
+                "0.0.0.0");
+  std::snprintf(g_ethernet.dns, sizeof(g_ethernet.dns), "%s", "0.0.0.0");
+}
+
+void EthernetEventHandler(void* arg, esp_event_base_t event_base,
+                          int32_t event_id, void* event_data)
+{
+  (void)arg;
+  (void)event_base;
+  (void)event_data;
+
+  switch (event_id) {
+    case ETHERNET_EVENT_CONNECTED:
+      g_ethernet.link_up = true;
+      printf("[ethernet] link up\n");
+      break;
+    case ETHERNET_EVENT_DISCONNECTED:
+      g_ethernet.link_up = false;
+      g_ethernet.has_ip = false;
+      ClearEthernetIpInfo();
+      printf("[ethernet] link down\n");
+      break;
+    case ETHERNET_EVENT_START:
+      g_ethernet.started = true;
+      printf("[ethernet] started\n");
+      break;
+    case ETHERNET_EVENT_STOP:
+      g_ethernet.started = false;
+      g_ethernet.link_up = false;
+      g_ethernet.has_ip = false;
+      ClearEthernetIpInfo();
+      printf("[ethernet] stopped\n");
+      break;
+    default:
+      break;
+  }
+}
+
+void EthernetIpEventHandler(void* arg, esp_event_base_t event_base,
+                            int32_t event_id, void* event_data)
+{
+  (void)arg;
+  (void)event_base;
+
+  if (event_id == IP_EVENT_ETH_GOT_IP) {
+    const ip_event_got_ip_t* event =
+        static_cast<const ip_event_got_ip_t*>(event_data);
+    g_ethernet.has_ip = true;
+    std::snprintf(g_ethernet.ip, sizeof(g_ethernet.ip), IPSTR,
+                  IP2STR(&event->ip_info.ip));
+    std::snprintf(g_ethernet.netmask, sizeof(g_ethernet.netmask), IPSTR,
+                  IP2STR(&event->ip_info.netmask));
+    std::snprintf(g_ethernet.gateway, sizeof(g_ethernet.gateway), IPSTR,
+                  IP2STR(&event->ip_info.gw));
+    UpdateEthernetIpInfo();
+    printf("[ethernet] DHCP IP %s\n", g_ethernet.ip);
+  } else if (event_id == IP_EVENT_ETH_LOST_IP) {
+    g_ethernet.has_ip = false;
+    ClearEthernetIpInfo();
+    printf("[ethernet] DHCP address lost\n");
+  }
+}
+
+esp_err_t ResetW5500()
+{
+  gpio_config_t reset_config = {};
+  reset_config.pin_bit_mask = 1ULL << t_can485_c5::gpio::w5500::kReset;
+  reset_config.mode = GPIO_MODE_OUTPUT;
+  reset_config.pull_up_en = GPIO_PULLUP_DISABLE;
+  reset_config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  reset_config.intr_type = GPIO_INTR_DISABLE;
+
+  esp_err_t err = gpio_config(&reset_config);
+  if (err != ESP_OK) {
+    return err;
+  }
+  err = gpio_set_level(
+      static_cast<gpio_num_t>(t_can485_c5::gpio::w5500::kReset), 0);
+  if (err != ESP_OK) {
+    return err;
+  }
+  vTaskDelay(pdMS_TO_TICKS(kW5500ResetAssertMs));
+  err = gpio_set_level(
+      static_cast<gpio_num_t>(t_can485_c5::gpio::w5500::kReset), 1);
+  if (err != ESP_OK) {
+    return err;
+  }
+  vTaskDelay(pdMS_TO_TICKS(kW5500ResetRecoveryMs));
+  return ESP_OK;
+}
+
+esp_err_t InitEthernet()
+{
+  esp_err_t err = gpio_install_isr_service(0);
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    return err;
+  }
+
+  err = ResetW5500();
+  if (err != ESP_OK) {
+    return err;
+  }
+  if (!InitSharedSpiBus()) {
+    return ESP_FAIL;
+  }
+
+  spi_device_interface_config_t device_config = {};
+  device_config.mode = 0;
+  device_config.clock_speed_hz = kW5500SpiClockMhz * 1000 * 1000;
+  device_config.spics_io_num = t_can485_c5::gpio::w5500::kCs;
+  device_config.queue_size = 20;
+
+  eth_w5500_config_t w5500_config =
+      ETH_W5500_DEFAULT_CONFIG(kSharedSpiHost, &device_config);
+  w5500_config.int_gpio_num = t_can485_c5::gpio::w5500::kInterrupt;
+
+  eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
+  mac_config.rx_task_stack_size = kW5500RxTaskStackSize;
+  eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
+  phy_config.phy_addr = t_can485_c5::device::w5500::kPhyAddress;
+  phy_config.reset_gpio_num = -1;
+
+  esp_eth_mac_t* mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
+  esp_eth_phy_t* phy = esp_eth_phy_new_w5500(&phy_config);
+  if (mac == nullptr || phy == nullptr) {
+    if (mac != nullptr) {
+      mac->del(mac);
+    }
+    if (phy != nullptr) {
+      phy->del(phy);
+    }
+    return ESP_ERR_NO_MEM;
+  }
+
+  esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
+  err = esp_eth_driver_install(&eth_config, &g_eth_handle);
+  if (err != ESP_OK) {
+    mac->del(mac);
+    phy->del(phy);
+    return err;
+  }
+
+  uint8_t base_mac[ETH_ADDR_LEN] = {};
+  uint8_t local_mac[ETH_ADDR_LEN] = {};
+  ESP_ERROR_CHECK(esp_read_mac(base_mac, ESP_MAC_ETH));
+  ESP_ERROR_CHECK(esp_derive_local_mac(local_mac, base_mac));
+  ESP_ERROR_CHECK(esp_eth_ioctl(g_eth_handle, ETH_CMD_S_MAC_ADDR, local_mac));
+  std::snprintf(g_ethernet.mac, sizeof(g_ethernet.mac),
+                "%02X:%02X:%02X:%02X:%02X:%02X", local_mac[0],
+                local_mac[1], local_mac[2], local_mac[3], local_mac[4],
+                local_mac[5]);
+
+  esp_netif_config_t netif_config = ESP_NETIF_DEFAULT_ETH();
+  g_eth_netif = esp_netif_new(&netif_config);
+  if (g_eth_netif == nullptr) {
+    return ESP_ERR_NO_MEM;
+  }
+  ESP_ERROR_CHECK(
+      esp_netif_set_hostname(g_eth_netif, "t-can485-c5-ethernet"));
+  auto eth_glue = esp_eth_new_netif_glue(g_eth_handle);
+  if (eth_glue == nullptr) {
+    return ESP_ERR_NO_MEM;
+  }
+  ESP_ERROR_CHECK(esp_netif_attach(g_eth_netif, eth_glue));
+  ESP_ERROR_CHECK(esp_event_handler_register(
+      ETH_EVENT, ESP_EVENT_ANY_ID, &EthernetEventHandler, nullptr));
+  ESP_ERROR_CHECK(esp_event_handler_register(
+      IP_EVENT, ESP_EVENT_ANY_ID, &EthernetIpEventHandler, nullptr));
+  return esp_eth_start(g_eth_handle);
 }
 
 const char* CardTypeName(const sdmmc_card_t* card)
@@ -389,15 +711,29 @@ const char* CardTypeName(const sdmmc_card_t* card)
   return (card->ocr & SD_OCR_SDHC_CAP) ? "SDHC/SDXC" : "SDSC";
 }
 
-bool ProbeSdCard()
+void ClearSdCardInfo(const char* error)
 {
-  if (!InitSdSpiBus()) {
-    g_sd_mounted = false;
-    std::snprintf(g_sd_error, sizeof(g_sd_error), "%s", "SPI bus init failed");
+  g_sd_mounted = false;
+  g_sd_size_mb = 0;
+  g_sd_sector_size = 0;
+  g_sd_sector_count = 0;
+  std::snprintf(g_sd_type, sizeof(g_sd_type), "%s", "Not mounted");
+  std::snprintf(g_sd_name, sizeof(g_sd_name), "%s", "-");
+  std::snprintf(g_sd_error, sizeof(g_sd_error), "%s", error);
+}
+
+bool MountSdCard()
+{
+  if (g_sd_mounted && g_sd_card != nullptr) {
+    return true;
+  }
+  if (!InitSharedSpiBus()) {
+    ClearSdCardInfo("SPI bus init failed");
     return false;
   }
 
   sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+  host.slot = kSharedSpiHost;
   host.max_freq_khz = kSdSpiMaxFreqKhz;
 
   sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
@@ -410,44 +746,62 @@ bool ProbeSdCard()
   mount_config.allocation_unit_size = 16 * 1024;
   mount_config.disk_status_check_enable = true;
 
-  sdmmc_card_t* card = nullptr;
   esp_err_t err = esp_vfs_fat_sdspi_mount(kMountPoint, &host, &slot_config,
-                                          &mount_config, &card);
+                                          &mount_config, &g_sd_card);
   if (err != ESP_OK) {
-    g_sd_mounted = false;
-    g_sd_size_mb = 0;
-    g_sd_sector_size = 0;
-    g_sd_sector_count = 0;
-    std::snprintf(g_sd_type, sizeof(g_sd_type), "%s", "Not mounted");
-    std::snprintf(g_sd_name, sizeof(g_sd_name), "%s", "-");
-    std::snprintf(g_sd_error, sizeof(g_sd_error), "%s", esp_err_to_name(err));
+    g_sd_card = nullptr;
+    char error[96] = {};
+    std::snprintf(error, sizeof(error), "%s (0x%x)", esp_err_to_name(err),
+                  static_cast<unsigned>(err));
+    ClearSdCardInfo(error);
     return false;
   }
 
   g_sd_mounted = true;
-  g_sd_size_mb = static_cast<uint64_t>(card->csd.capacity) *
-                 card->csd.sector_size / (1024ULL * 1024ULL);
-  g_sd_sector_size = card->csd.sector_size;
-  g_sd_sector_count = card->csd.capacity;
-  std::snprintf(g_sd_type, sizeof(g_sd_type), "%s", CardTypeName(card));
+  g_sd_size_mb = static_cast<uint64_t>(g_sd_card->csd.capacity) *
+                 g_sd_card->csd.sector_size / (1024ULL * 1024ULL);
+  g_sd_sector_size = g_sd_card->csd.sector_size;
+  g_sd_sector_count = g_sd_card->csd.capacity;
+  std::snprintf(g_sd_type, sizeof(g_sd_type), "%s",
+                CardTypeName(g_sd_card));
   std::snprintf(g_sd_name, sizeof(g_sd_name), "%.5s",
-                reinterpret_cast<const char*>(card->cid.name));
+                reinterpret_cast<const char*>(g_sd_card->cid.name));
   std::snprintf(g_sd_error, sizeof(g_sd_error), "%s", "OK");
-  esp_vfs_fat_sdcard_unmount(kMountPoint, card);
   return true;
+}
+
+bool MountedSdCardStillReadable()
+{
+  return g_sd_mounted && g_sd_card != nullptr &&
+         sdmmc_get_status(g_sd_card) == ESP_OK;
+}
+
+void UnmountSdCard(const char* error)
+{
+  if (g_sd_mounted && g_sd_card != nullptr) {
+    esp_vfs_fat_sdcard_unmount(kMountPoint, g_sd_card);
+  }
+  g_sd_card = nullptr;
+  ClearSdCardInfo(error);
 }
 
 void SdTask(void* param)
 {
   (void)param;
-  bool last_mounted = false;
   while (true) {
-    ProbeSdCard();
-    if (g_sd_mounted != last_mounted) {
-      printf("[sd] %s\n", g_sd_mounted ? "inserted" : "removed");
-      last_mounted = g_sd_mounted;
+    int delay_ms = kSdStatusPollPeriodMs;
+    if (!g_sd_mounted) {
+      if (MountSdCard()) {
+        printf("[sd] mounted: %s, %llu MB\n", g_sd_name,
+               static_cast<unsigned long long>(g_sd_size_mb));
+      }
+      delay_ms = kSdRetryPeriodMs;
+    } else if (!MountedSdCardStillReadable()) {
+      printf("[sd] removed or unavailable; waiting for card\n");
+      UnmountSdCard("Removed; waiting for card");
+      delay_ms = kSdRetryPeriodMs;
     }
-    vTaskDelay(pdMS_TO_TICKS(kSdPollPeriodMs));
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
   }
 }
 
@@ -1072,10 +1426,16 @@ const char* StatusJson()
       "\"time\":\"%s\",\"time_age_seconds\":%lu,"
       "\"wifi\":{\"sta\":%s,\"sta_ssid\":\"%s\",\"sta_ip\":\"%s\","
       "\"sta_rssi\":%d,\"ap_ssid\":\"%s\",\"ap_ip\":\"%s\"},"
+      "\"ethernet\":{\"started\":%s,\"link\":%s,\"has_ip\":%s,"
+      "\"mac\":\"%s\",\"ip\":\"%s\",\"netmask\":\"%s\","
+      "\"gateway\":\"%s\",\"dns\":\"%s\"},"
       "\"sd\":{\"mounted\":%s,\"name\":\"%s\",\"type\":\"%s\","
       "\"size_mb\":%llu,\"sector_size\":%lu,\"sector_count\":%llu,"
       "\"error\":\"%s\"},"
-      "\"adc\":[%d,%d,%d],"
+      "\"adc\":{\"measured_mv\":%d,\"theoretical_mv\":%d},"
+      "\"digital_input\":{\"active\":%s},"
+      "\"button\":{\"pressed\":%s,\"gpio\":%d},"
+      "\"ws2812\":{\"color\":\"%s\"},"
       "\"rs485\":{\"mode\":\"%s\",\"total\":%u,\"ok\":%s,"
       "\"crc_errors\":%lu,\"sequence_errors\":%lu},"
       "\"can\":{\"mode\":\"%s\",\"total\":%u,\"ok\":%s,\"state\":\"%s\","
@@ -1084,11 +1444,19 @@ const char* StatusJson()
       g_time_text, static_cast<unsigned long>(g_time_age_seconds),
       g_wifi_sta_connected ? "true" : "false", g_sta_ssid,
       g_sta_ip, static_cast<int>(g_sta_rssi), g_ap_ssid, g_ap_ip,
+      g_ethernet.started ? "true" : "false",
+      g_ethernet.link_up ? "true" : "false",
+      g_ethernet.has_ip ? "true" : "false", g_ethernet.mac, g_ethernet.ip,
+      g_ethernet.netmask, g_ethernet.gateway, g_ethernet.dns,
       g_sd_mounted ? "true" : "false", g_sd_name, g_sd_type,
       static_cast<unsigned long long>(g_sd_size_mb),
       static_cast<unsigned long>(g_sd_sector_size),
       static_cast<unsigned long long>(g_sd_sector_count), g_sd_error,
-      g_adc_mv[0], g_adc_mv[1], g_adc_mv[2], ModeName(rs485_mode),
+      g_adc_pin_mv, g_adc_input_mv,
+      g_digital_input_active ? "true" : "false",
+      g_boot_button_pressed ? "true" : "false",
+      t_can485_c5::gpio::button::kEsp32c5Boot,
+      Ws2812ColorName(), ModeName(rs485_mode),
       static_cast<unsigned>(g_rs485_total_size),
       g_rs485_data_ok ? "true" : "false",
       static_cast<unsigned long>(g_rs485_crc_error_count),
@@ -1112,6 +1480,7 @@ h1{margin:0;font-size:24px}main{padding:18px;display:grid;gap:14px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
 .card{background:#18222c;border:1px solid #2b3a47;border-radius:8px;padding:16px}
 .label{color:#91a4b4;font-size:13px}.value{font-size:26px;margin-top:6px}
+.input-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-top:12px}
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
 button{background:#263746;color:#e8eef2;border:1px solid #41566a;border-radius:6px;padding:10px 14px}
 button.active{background:#1f8f5f;border-color:#32b878}
@@ -1119,16 +1488,19 @@ button.active{background:#1f8f5f;border-color:#32b878}
 </style>
 </head>
 <body>
-<header><h1>T-CAN485-C5 Control Center</h1><div class="small">AP and STA are enabled</div></header>
+<header><h1>T-CAN485-C5 Control Center</h1><div class="small">W5500 Ethernet and Wi-Fi AP/STA are enabled</div></header>
 <main>
 <section class="grid">
 <div class="card"><div class="label">AP</div><div class="value" id="ap">-</div><div class="small" id="apip"></div></div>
 <div class="card"><div class="label">STA</div><div class="value" id="sta">-</div><div class="small" id="staip"></div></div>
 <div class="card"><div class="label">Time</div><div class="value" id="time">-</div><div class="small" id="timeage"></div></div>
+<div class="card"><div class="label">W5500 Ethernet (DHCP)</div><div class="value" id="eth">-</div><div class="small" id="ethinfo"></div></div>
 </section>
 <section class="grid">
 <div class="card"><div class="label">SD Card</div><div class="value" id="sd">-</div><div class="small" id="sdinfo"></div></div>
-<div class="card"><div class="label">ADC</div><div class="value" id="adc">-</div></div>
+<div class="card"><div class="label">0-24V Inputs</div><div class="input-grid"><div><div class="small">GPIO4 measured voltage</div><div class="value" id="adcmeasured">-</div></div><div><div class="small">P2 theoretical input voltage</div><div class="value" id="adctheoretical">-</div></div><div><div class="small">PC817 digital input on GPIO24, active low</div><div class="value" id="digitalinput">-</div></div></div></div>
+<div class="card"><div class="label">BOOT Button</div><div class="value" id="bootbutton">-</div><div class="small" id="bootbuttoninfo"></div></div>
+<div class="card"><div class="label">WS2812</div><div class="value" id="ws2812">-</div><div class="small">GPIO3, red / green / blue / white / black</div><div class="row"><button onclick="setMode('ws2812','next')">Next color</button></div></div>
 </section>
 <section class="grid">
 <div class="card"><div class="label">RS485</div><div class="value" id="rs485">-</div><div class="small" id="rs485t"></div><div class="row"><button onclick="setMode('rs485','send')">Send</button><button onclick="setMode('rs485','receive')">Receive</button><button onclick="setMode('rs485','stop')">Stop</button></div></div>
@@ -1139,10 +1511,17 @@ button.active{background:#1f8f5f;border-color:#32b878}
 async function setMode(target,mode){await fetch(`/api/set?target=${target}&mode=${mode}`);refresh();}
 async function refresh(){
  const s=await (await fetch('/api/status')).json();
+ const eth=document.getElementById('eth'); const ethinfo=document.getElementById('ethinfo'); const adcmeasured=document.getElementById('adcmeasured'); const adctheoretical=document.getElementById('adctheoretical'); const digitalinput=document.getElementById('digitalinput'); const bootbutton=document.getElementById('bootbutton'); const bootbuttoninfo=document.getElementById('bootbuttoninfo'); const ws2812=document.getElementById('ws2812');
+ eth.textContent=s.ethernet.has_ip?'Ready':(s.ethernet.link?'DHCP':'Link down'); eth.className='value '+(s.ethernet.has_ip?'ok':'bad');
+ ethinfo.innerHTML=`MAC ${s.ethernet.mac}<br>IP ${s.ethernet.ip} | mask ${s.ethernet.netmask} | gateway ${s.ethernet.gateway} | DNS ${s.ethernet.dns}`;
  time.textContent=s.time; timeage.textContent=`updated ${s.time_age_seconds} s ago`; sta.textContent=s.wifi.sta?s.wifi.sta_ssid:'Connecting'; sta.className='value '+(s.wifi.sta?'ok':'bad');
  staip.textContent=s.wifi.sta?`${s.wifi.sta_ip} | RSSI ${s.wifi.sta_rssi} dBm`:s.wifi.sta_ip; ap.textContent=s.wifi.ap_ssid; apip.textContent=s.wifi.ap_ip;
  sd.textContent=s.sd.mounted?'Detected':'Not detected'; sd.className='value '+(s.sd.mounted?'ok':'bad'); sdinfo.textContent=`name ${s.sd.name} | ${s.sd.type} | ${s.sd.size_mb} MB | sector ${s.sd.sector_size} B | count ${s.sd.sector_count} | ${s.sd.error}`;
- adc.innerHTML=`ADC1: ${s.adc[0]} mV<br>ADC2: ${s.adc[1]} mV<br>ADC3: ${s.adc[2]} mV`;
+ adcmeasured.textContent=s.adc.measured_mv>=0?`${(s.adc.measured_mv/1000).toFixed(3)} V`:'Unavailable'; adcmeasured.className='value '+(s.adc.measured_mv>=0?'ok':'bad');
+ adctheoretical.textContent=s.adc.theoretical_mv>=0?`${(s.adc.theoretical_mv/1000).toFixed(2)} V`:'Unavailable'; adctheoretical.className='value '+(s.adc.theoretical_mv>=0?'ok':'bad');
+ digitalinput.textContent=s.digital_input.active?'Active':'Inactive'; digitalinput.className='value '+(s.digital_input.active?'ok':'');
+ bootbutton.textContent=s.button.pressed?'Pressed':'Released'; bootbutton.className='value '+(s.button.pressed?'ok':'bad'); bootbuttoninfo.textContent=`GPIO ${s.button.gpio} | active low`;
+ ws2812.textContent=s.ws2812.color.charAt(0).toUpperCase()+s.ws2812.color.slice(1);
  const rs485Mode=s.rs485.mode.charAt(0).toUpperCase()+s.rs485.mode.slice(1);
  const canMode=s.can.mode.charAt(0).toUpperCase()+s.can.mode.slice(1);
  rs485.textContent=rs485Mode; rs485.className='value '+(s.rs485.ok?'ok':'bad'); rs485t.textContent=s.rs485.mode==='send'?`total ${s.rs485.total} B`:`total ${s.rs485.total} B | crc error ${s.rs485.crc_errors} | seq error ${s.rs485.sequence_errors}`;
@@ -1195,6 +1574,13 @@ esp_err_t SetHandler(httpd_req_t* request)
     g_rs485_mode = ParseMode(mode);
   } else if (std::strcmp(target, "can") == 0) {
     g_can_mode = ParseMode(mode);
+  } else if (std::strcmp(target, "ws2812") == 0 &&
+             std::strcmp(mode, "next") == 0) {
+    const esp_err_t err = NextWs2812Color();
+    if (err != ESP_OK) {
+      return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                 esp_err_to_name(err));
+    }
   }
 
   httpd_resp_set_type(request, "application/json");
@@ -1233,19 +1619,30 @@ void StartHttpServer()
 extern "C" void app_main(void)
 {
   printf("Ciallo\n");
-  InitAdcLed();
+  InitDigitalInput();
+  InitBootButton();
+  ESP_ERROR_CHECK(InitWs2812());
   InitWifi();
   UpdateTimeText();
+  const esp_err_t ethernet_err = InitEthernet();
+  if (ethernet_err != ESP_OK) {
+    printf("[ethernet] initialization failed: %s (0x%x)\n",
+           esp_err_to_name(ethernet_err),
+           static_cast<unsigned>(ethernet_err));
+  }
   StartHttpServer();
+  printf("[sd] automatic detection started\n");
 
   xTaskCreate(TimeTask, "time_task", kTaskStackSize, nullptr, kTaskPriority,
               nullptr);
   xTaskCreate(WifiInfoTask, "wifi_info_task", kTaskStackSize, nullptr,
               kTaskPriority, nullptr);
-  xTaskCreate(Ws2812Task, "ws2812_task", kTaskStackSize, nullptr,
-              kTaskPriority, nullptr);
   xTaskCreate(AdcTask, "adc_task", kTaskStackSize, nullptr, kTaskPriority,
               nullptr);
+  xTaskCreate(DigitalInputTask, "digital_input_task", kTaskStackSize, nullptr,
+              kTaskPriority, nullptr);
+  xTaskCreate(ButtonTask, "button_task", kTaskStackSize, nullptr,
+              kTaskPriority, nullptr);
   xTaskCreate(SdTask, "sd_task", kTaskStackSize, nullptr, kTaskPriority,
               nullptr);
   xTaskCreate(Rs485Task, "rs485_task", kTaskStackSize, nullptr,
@@ -1255,6 +1652,9 @@ extern "C" void app_main(void)
 
   printf("HTTP control center: connect AP %s password %s, open http://%s\n",
          g_ap_ssid, kWifiApPassword, g_ap_ip);
+  if (ethernet_err == ESP_OK) {
+    printf("HTTP control center will also use the W5500 DHCP address\n");
+  }
   while (true) {
     vTaskDelay(pdMS_TO_TICKS(1000));
   }

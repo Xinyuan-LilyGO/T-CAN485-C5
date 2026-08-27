@@ -1,13 +1,11 @@
 /*
- * @Description: ADC voltage read example
+ * @Description: ADC voltage and isolated digital input example
  * @Author: LILYGO_L
- * @Date: 2026-06-12 12:00:00
- * @LastEditTime: 2026-06-12 12:00:00
+ * @Date: 2026-08-26 12:00:00
+ * @LastEditTime: 2026-08-26 17:30:00
  * @License: GPL 3.0
  */
 
-#include <array>
-#include <cstdint>
 #include <cstdio>
 
 #include "driver/gpio.h"
@@ -25,7 +23,8 @@ namespace t_can485_c5 = lilygo_device_driver::t_can485_c5;
 
 constexpr adc_atten_t kAdcAtten = ADC_ATTEN_DB_12;
 constexpr adc_bitwidth_t kAdcBitwidth = ADC_BITWIDTH_12;
-constexpr int kReadPeriodMs = 500;
+constexpr int kDigitalInputPollPeriodMs = 20;
+constexpr int kAdcReadPeriodMs = 500;
 constexpr int kAdcMaxRaw = 4095;
 constexpr int kAdcApproxMaxVoltageMv = 3300;
 
@@ -37,29 +36,6 @@ struct AdcInput {
   adc_cali_handle_t calibration = nullptr;
 };
 
-void InitLed()
-{
-  const uint64_t pin_mask =
-      (1ULL << t_can485_c5::gpio::led::kNumber1) |
-      (1ULL << t_can485_c5::gpio::led::kNumber2) |
-      (1ULL << t_can485_c5::gpio::led::kNumber3);
-
-  gpio_config_t config = {};
-  config.pin_bit_mask = pin_mask;
-  config.mode = GPIO_MODE_OUTPUT;
-  config.pull_up_en = GPIO_PULLUP_DISABLE;
-  config.pull_down_en = GPIO_PULLDOWN_DISABLE;
-  config.intr_type = GPIO_INTR_DISABLE;
-  ESP_ERROR_CHECK(gpio_config(&config));
-
-  ESP_ERROR_CHECK(gpio_set_level(
-      static_cast<gpio_num_t>(t_can485_c5::gpio::led::kNumber1), 0));
-  ESP_ERROR_CHECK(gpio_set_level(
-      static_cast<gpio_num_t>(t_can485_c5::gpio::led::kNumber2), 0));
-  ESP_ERROR_CHECK(gpio_set_level(
-      static_cast<gpio_num_t>(t_can485_c5::gpio::led::kNumber3), 0));
-}
-
 bool InitCalibration(const AdcInput& input, adc_cali_handle_t* calibration)
 {
 #if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
@@ -69,7 +45,7 @@ bool InitCalibration(const AdcInput& input, adc_cali_handle_t* calibration)
   calibration_config.atten = kAdcAtten;
   calibration_config.bitwidth = kAdcBitwidth;
   return adc_cali_create_scheme_curve_fitting(&calibration_config,
-             calibration) == ESP_OK;
+                                               calibration) == ESP_OK;
 #else
   (void)input;
   (void)calibration;
@@ -113,7 +89,8 @@ int ReadVoltage(adc_oneshot_unit_handle_t adc_handle, const AdcInput& input)
   if (input.calibration != nullptr) {
     int voltage_mv = 0;
     if (adc_oneshot_get_calibrated_result(adc_handle, input.calibration,
-            input.channel, &voltage_mv) == ESP_OK) {
+                                          input.channel,
+                                          &voltage_mv) == ESP_OK) {
       return voltage_mv;
     }
   }
@@ -125,38 +102,82 @@ int ReadVoltage(adc_oneshot_unit_handle_t adc_handle, const AdcInput& input)
   return raw * kAdcApproxMaxVoltageMv / kAdcMaxRaw;
 }
 
+int ScaleInputVoltage(int adc_voltage_mv)
+{
+  return adc_voltage_mv *
+         t_can485_c5::device::adc::kInputScaleNumerator /
+         t_can485_c5::device::adc::kInputScaleDenominator;
+}
+
+void PrintAdcReading(adc_oneshot_unit_handle_t adc_handle,
+                     const AdcInput& input)
+{
+  const int adc_voltage_mv = ReadVoltage(adc_handle, input);
+  if (adc_voltage_mv >= 0) {
+    printf("%s GPIO%d: ADC %d mV, input about %d mV\n", input.name,
+           input.gpio, adc_voltage_mv, ScaleInputVoltage(adc_voltage_mv));
+  } else {
+    printf("%s GPIO%d: read failed\n", input.name, input.gpio);
+  }
+}
+
+void InitDigitalInput()
+{
+  gpio_config_t config = {};
+  config.pin_bit_mask =
+      1ULL << t_can485_c5::gpio::digital_input::kOptocoupler;
+  config.mode = GPIO_MODE_INPUT;
+  config.pull_up_en = GPIO_PULLUP_DISABLE;
+  config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  config.intr_type = GPIO_INTR_DISABLE;
+  ESP_ERROR_CHECK(gpio_config(&config));
+}
+
+bool ReadDigitalInputActive()
+{
+  return gpio_get_level(static_cast<gpio_num_t>(
+             t_can485_c5::gpio::digital_input::kOptocoupler)) ==
+         t_can485_c5::device::digital_input::kActiveLevel;
+}
+
 }  // namespace
 
 extern "C" void app_main(void)
 {
-  printf("Ciallo\n");
-  InitLed();
+  printf("T-CAN485-C5 ADC and isolated digital input test\n");
 
   adc_oneshot_unit_init_cfg_t unit_config = {};
   unit_config.unit_id = ADC_UNIT_1;
   adc_oneshot_unit_handle_t adc_handle = nullptr;
   ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_config, &adc_handle));
 
-  std::array<AdcInput, 3> inputs = {
-      AdcInput{"ADC_1", t_can485_c5::gpio::adc::kChannel1},
-      AdcInput{"ADC_2", t_can485_c5::gpio::adc::kChannel2},
-      AdcInput{"ADC_3", t_can485_c5::gpio::adc::kChannel3},
-  };
+  AdcInput adc_input{"0-24V ADC", t_can485_c5::gpio::adc::kVoltage};
+  ESP_ERROR_CHECK(InitAdcInput(adc_handle, &adc_input) ? ESP_OK : ESP_FAIL);
 
-  for (auto& input : inputs) {
-    ESP_ERROR_CHECK(InitAdcInput(adc_handle, &input) ? ESP_OK : ESP_FAIL);
-  }
+  InitDigitalInput();
+  bool last_digital_input_active = ReadDigitalInputActive();
+  printf("Isolated 0-24V input GPIO%d: %s (active low)\n",
+         t_can485_c5::gpio::digital_input::kOptocoupler,
+         last_digital_input_active ? "active" : "inactive");
+  PrintAdcReading(adc_handle, adc_input);
 
+  TickType_t last_adc_read_tick = xTaskGetTickCount();
+  TickType_t last_wake_tick = last_adc_read_tick;
   while (true) {
-    for (const auto& input : inputs) {
-      const int voltage_mv = ReadVoltage(adc_handle, input);
-      if (voltage_mv >= 0) {
-        printf("%s GPIO%d: %d mV\n", input.name, input.gpio, voltage_mv);
-      } else {
-        printf("%s GPIO%d: read failed\n", input.name, input.gpio);
-      }
+    const bool digital_input_active = ReadDigitalInputActive();
+    if (digital_input_active != last_digital_input_active) {
+      printf("Isolated 0-24V input: %s\n",
+             digital_input_active ? "active" : "inactive");
+      last_digital_input_active = digital_input_active;
     }
-    printf("\n");
-    vTaskDelay(pdMS_TO_TICKS(kReadPeriodMs));
+
+    const TickType_t now = xTaskGetTickCount();
+    if (now - last_adc_read_tick >= pdMS_TO_TICKS(kAdcReadPeriodMs)) {
+      PrintAdcReading(adc_handle, adc_input);
+      last_adc_read_tick = now;
+    }
+
+    vTaskDelayUntil(&last_wake_tick,
+                    pdMS_TO_TICKS(kDigitalInputPollPeriodMs));
   }
 }

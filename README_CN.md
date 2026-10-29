@@ -86,7 +86,7 @@ Example Configuration
 
 | 固件 | 烧录地址 | 说明 |
 | --- | --- | --- |
-| [`general_test`](<./firmware/[t-can485-c5][general_test]/[t-can485-c5][general_test]_firmware_202608271614.bin>) | 参见固件说明 | 板卡综合测试预编译固件；烧录前请确认固件格式和对应的 Flash 参数 |
+| [`general_test`](<./firmware/[t-can485-c5][general_test]/[t-can485-c5][general_test]_firmware_202608271614.bin>) | `0x0` | 板卡综合测试预编译固件 |
 
 ## 硬件模块
 

@@ -86,7 +86,7 @@ The following general-test firmware is provided:
 
 | Firmware | Flash Address | Description |
 | --- | --- | --- |
-| [`general_test`](<./firmware/[t-can485-c5][general_test]/[t-can485-c5][general_test]_firmware_202608271614.bin>) | See firmware notes | Prebuilt general board test firmware; confirm the image format and flash settings before flashing |
+| [`general_test`](<./firmware/[t-can485-c5][general_test]/[t-can485-c5][general_test]_firmware_202608271614.bin>) | `0x0` | Prebuilt general board test firmware |
 
 ## Hardware Modules
 
